@@ -1,6 +1,9 @@
+use criterion::async_executor::AsyncExecutor;
 use criterion::{criterion_group, criterion_main, Bencher, BenchmarkId, Criterion};
 use sqlx_core::any::AnyPoolOptions;
 use std::fmt::{Display, Formatter};
+use std::future::Future;
+use std::time::Instant;
 use tracing::Instrument;
 
 #[derive(Debug)]
@@ -104,13 +107,28 @@ fn bench_pool_with(b: &mut Bencher, input: &Input, database_url: &str) {
         );
     }
 
-    b.to_async(&runtime).iter(|| {
-        async {
-            if let Err(e) = pool.acquire().await {
-                panic!("failed to acquire connection: {e:?}");
-            }
+    // Spawn the benchmark loop into the runtime so we're not accidentally including the main thread
+    b.to_async(&runtime).iter_custom(|iters| {
+        let pool = pool.clone();
+
+        async move {
+            tokio::spawn(
+                async move {
+                    let start = Instant::now();
+
+                    for _ in 0..iters {
+                        if let Err(e) = pool.acquire().await {
+                            panic!("failed to acquire connection: {e:?}");
+                        }
+                    }
+
+                    start.elapsed()
+                }
+                .instrument(tracing::info_span!("iter")),
+            )
+            .await
+            .expect("panic in task")
         }
-        .instrument(tracing::info_span!("iter"))
     });
 
     drop(pool.close());
