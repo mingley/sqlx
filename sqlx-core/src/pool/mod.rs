@@ -92,6 +92,8 @@ mod options;
 
 mod shard;
 
+mod connection_set;
+
 /// An asynchronous pool of SQLx database connections.
 ///
 /// Create a pool with [Pool::connect] or [Pool::connect_with] and then call [Pool::acquire]
