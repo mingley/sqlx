@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use crate::pool::shard::DisconnectedSlot;
+use crate::pool::connection_set::DisconnectedSlot;
 #[cfg(doc)]
 use crate::pool::PoolOptions;
 use crate::sync::{AsyncMutex, AsyncMutexGuard};
@@ -656,6 +656,7 @@ async fn connect_with_backoff<DB: Database>(
 
                 return Ok(PoolConnection::new(
                     slot.put(ConnectionInner {
+                        pool: Arc::downgrade(&pool.0),
                         raw: conn,
                         id: connection_id,
                         created_at: now,

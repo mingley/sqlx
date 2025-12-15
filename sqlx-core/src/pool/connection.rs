@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug, Formatter};
 use std::future::{self, Future};
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::connection::Connection;
@@ -10,8 +10,8 @@ use crate::error::Error;
 
 use super::inner::{is_beyond_max_lifetime, PoolInner};
 use crate::pool::connect::{ConnectPermit, ConnectTaskShared, ConnectionId};
+use crate::pool::connection_set::{ConnectedSlot, DisconnectedSlot};
 use crate::pool::options::PoolConnectionMetadata;
-use crate::pool::shard::{ConnectedSlot, DisconnectedSlot};
 use crate::pool::Pool;
 use crate::rt;
 
@@ -23,11 +23,12 @@ const CLOSE_ON_DROP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Will be returned to the pool on-drop.
 pub struct PoolConnection<DB: Database> {
     conn: Option<ConnectedSlot<ConnectionInner<DB>>>,
-    pub(crate) pool: Arc<PoolInner<DB>>,
     close_on_drop: bool,
 }
 
 pub(super) struct ConnectionInner<DB: Database> {
+    // Note: must be `Weak` to prevent a reference cycle
+    pub(crate) pool: Weak<PoolInner<DB>>,
     pub(super) raw: DB::Connection,
     pub(super) id: ConnectionId,
     pub(super) created_at: Instant,
@@ -76,7 +77,6 @@ impl<DB: Database> PoolConnection<DB> {
         Self {
             conn: Some(live),
             close_on_drop: false,
-            pool,
         }
     }
 
@@ -140,7 +140,6 @@ impl<DB: Database> PoolConnection<DB> {
     #[doc(hidden)]
     pub fn return_to_pool(&mut self) -> impl Future<Output = ()> + Send + 'static {
         let conn = self.conn.take();
-        let pool = self.pool.clone();
 
         async move {
             let Some(conn) = conn else {

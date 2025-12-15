@@ -90,7 +90,7 @@ mod inner;
 // mod idle;
 mod options;
 
-mod shard;
+// mod shard;
 
 mod connection_set;
 

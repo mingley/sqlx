@@ -16,7 +16,7 @@ use crate::logger::private_level_filter_to_trace_level;
 use crate::pool::connect::{
     ConnectPermit, ConnectTask, ConnectTaskShared, ConnectionCounter, ConnectionId, DynConnector,
 };
-use crate::pool::shard::{ConnectedSlot, DisconnectedSlot, Sharded};
+use crate::pool::connection_set::{ConnectedSlot, ConnectionSet, DisconnectedSlot};
 use crate::rt::JoinHandle;
 use crate::{private_tracing_dynamic_event, rt};
 use either::Either;
@@ -31,7 +31,7 @@ const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct PoolInner<DB: Database> {
     pub(super) connector: DynConnector<DB>,
     pub(super) counter: ConnectionCounter,
-    pub(super) sharded: Sharded<ConnectionInner<DB>>,
+    pub(super) connections: ConnectionSet<ConnectionInner<DB>>,
     is_closed: AtomicBool,
     pub(super) on_closed: event_listener::Event,
     pub(super) options: PoolOptions<DB>,
@@ -44,39 +44,15 @@ impl<DB: Database> PoolInner<DB> {
         options: PoolOptions<DB>,
         connector: impl PoolConnector<DB>,
     ) -> Arc<Self> {
-        let pool = Arc::<Self>::new_cyclic(|pool_weak| {
-            let pool_weak = pool_weak.clone();
-
-            let reconnect = move |slot| {
-                let Some(pool) = pool_weak.upgrade() else {
-                    // Prevent an infinite loop on pool drop.
-                    DisconnectedSlot::leak(slot);
-                    return;
-                };
-
-                pool.connector.connect(
-                    Pool(pool.clone()),
-                    ConnectionId::next(),
-                    slot,
-                    ConnectTaskShared::new_arc(),
-                );
-            };
-
-            Self {
-                connector: DynConnector::new(connector),
-                counter: ConnectionCounter::new(),
-                sharded: Sharded::new(
-                    options.max_connections,
-                    options.shards,
-                    options.min_connections,
-                    reconnect,
-                ),
-                is_closed: AtomicBool::new(false),
-                on_closed: event_listener::Event::new(),
-                acquire_time_level: private_level_filter_to_trace_level(options.acquire_time_level),
-                acquire_slow_level: private_level_filter_to_trace_level(options.acquire_slow_level),
-                options,
-            }
+        let pool = Arc::new(Self {
+            connector: DynConnector::new(connector),
+            counter: ConnectionCounter::new(),
+            connections: ConnectionSet::new(options.max_connections),
+            is_closed: AtomicBool::new(false),
+            on_closed: event_listener::Event::new(),
+            acquire_time_level: private_level_filter_to_trace_level(options.acquire_time_level),
+            acquire_slow_level: private_level_filter_to_trace_level(options.acquire_slow_level),
+            options,
         });
 
         spawn_maintenance_tasks(&pool);
@@ -85,11 +61,11 @@ impl<DB: Database> PoolInner<DB> {
     }
 
     pub(super) fn size(&self) -> usize {
-        self.sharded.count_connected()
+        self.connections.num_connected()
     }
 
     pub(super) fn num_idle(&self) -> usize {
-        self.sharded.count_unlocked(true)
+        self.connections.count_idle()
     }
 
     pub(super) fn is_closed(&self) -> bool {
@@ -105,7 +81,7 @@ impl<DB: Database> PoolInner<DB> {
         self.mark_closed();
 
         // Keep clearing the idle queue as connections are released until the count reaches zero.
-        self.sharded.drain(|slot| async move {
+        self.connections.drain(async |slot| {
             let (conn, slot) = ConnectedSlot::take(slot);
 
             let _ = rt::timeout(GRACEFUL_CLOSE_TIMEOUT, conn.raw.close()).await;
